@@ -1,77 +1,86 @@
-import sqlite3
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+import logging
+from logging.handlers import RotatingFileHandler
+import re
 from pathlib import Path
 from email.message import EmailMessage
+
+import pandas as pd
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
 import openpyxl
 from openpyxl import load_workbook
+
+# ========= External dependency you provide =========
+# This must be implemented in your environment.
+# It should return a pandas.DataFrame with columns in the same order as the SELECT.
+from your_module import run_ccb_query  # <-- replace with the real import path
+
 
 # =========================
 # Config
 # =========================
-DB_PATH = "sample_accounts.db"          # swap for your DB or change get_connection()
+LOG_PATH = Path("account_app.log")
 TEMPLATE_PATH = Path("account_template.xlsx")
 OUTPUT_PATH = Path("account_report.xlsx")
 
+APP_NAME = "Account Lookup & Export (DF/CCB)"
+
 
 # =========================
-# Database helpers
+# Logging
 # =========================
-def get_connection():
-    # Swap for Postgres/MySQL as needed.
-    # Example (Postgres - psycopg2):
-    # import psycopg2
-    # return psycopg2.connect(host="localhost", port=5432, dbname="yourdb", user="youruser", password="yourpass")
-    return sqlite3.connect(DB_PATH)
+logger = logging.getLogger("account_app")
+logger.setLevel(logging.INFO)
 
-def ensure_demo_db():
-    """Create a tiny demo table if using SQLite and it doesn't exist."""
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                acct_id TEXT PRIMARY KEY,
-                name TEXT,
-                segment TEXT,
-                balance REAL,
-                status TEXT
-            )
-        """)
-        cur.executemany("""
-            INSERT OR IGNORE INTO accounts (acct_id, name, segment, balance, status)
-            VALUES (?, ?, ?, ?, ?)
-        """, [
-            ("A001", "Acme Corp", "Enterprise", 120000.50, "Active"),
-            ("A002", "Beta LLC", "SMB", 15890.00, "Suspended"),
-            ("A003", "Cygnus Inc", "Mid-Market", 5020.75, "Active"),
-        ])
-        conn.commit()
-    except Exception as e:
-        print("DB init warning:", e)
-    finally:
-        try: conn.close()
-        except: pass
+# Rotate at ~1 MB, keep 5 backups
+handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=5, encoding="utf-8")
+fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+handler.setFormatter(fmt)
+logger.addHandler(handler)
 
-def fetch_account(acct_id: str):
-    query = """
-        SELECT acct_id, name, segment, balance, status
+logger.info("=== Application start ===")
+
+
+# =========================
+# Utilities
+# =========================
+SAFE_ACCT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-\.]{1,64}$")
+
+def sanitize_acct_id(acct_id: str) -> str:
+    """
+    Enforce a conservative allowlist for acct_id to reduce injection risk since
+    run_ccb_query expects a raw SQL string.
+    """
+    if not acct_id or not SAFE_ACCT_ID_PATTERN.match(acct_id):
+        raise ValueError("acct_id contains invalid characters.")
+    return acct_id
+
+def build_select_query(acct_id: str) -> str:
+    # NOTE: Because run_ccb_query takes a string, we avoid concatenating unsafe input.
+    # We sanitize acct_id first (allowlist). If your CCB layer supports parameters,
+    # switch to parameterized queries there.
+    return f"""
+        SELECT
+            acct_id,
+            name,
+            segment,
+            balance,
+            status
         FROM accounts
-        WHERE acct_id = ?
-    """  # change ? to %s if using psycopg2/mysql-connector
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(query, (acct_id,))
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description] if cur.description else []
-        return query, cols, rows
-    finally:
-        conn.close()
+        WHERE acct_id = '{acct_id}'
+    """.strip()
+
+def df_to_tuples(df: pd.DataFrame):
+    """Return (columns, rows_as_tuples) in display-friendly types."""
+    cols = list(df.columns)
+    # Ensure pure Python types for Tk/Excel
+    rows = [tuple(None if pd.isna(v) else (v.item() if hasattr(v, "item") else v) for v in row)
+            for row in df.itertuples(index=False, name=None)]
+    return cols, rows
 
 
 # =========================
-# Excel helpers
+# Excel helpers (template-based)
 # =========================
 def ensure_template_with_headers(headers):
     """Create a very simple template if none exists."""
@@ -82,11 +91,13 @@ def ensure_template_with_headers(headers):
         for i, col in enumerate(headers, start=1):
             ws.cell(row=1, column=i, value=col)
         wb.save(TEMPLATE_PATH)
+        logger.info(f"Template created at {TEMPLATE_PATH.resolve()} with headers: {headers}")
 
-def write_to_template(cols, rows, template_path: Path = TEMPLATE_PATH, output_path: Path = OUTPUT_PATH):
-    if not cols:
-        raise ValueError("No columns to write to template.")
-    ensure_template_with_headers(cols)
+def write_df_to_template(df: pd.DataFrame, template_path: Path = TEMPLATE_PATH, output_path: Path = OUTPUT_PATH) -> Path:
+    if df is None or df.empty:
+        raise ValueError("No data to write to template.")
+    headers = list(df.columns)
+    ensure_template_with_headers(headers)
 
     wb = load_workbook(template_path)
     if "Report" not in wb.sheetnames:
@@ -94,25 +105,31 @@ def write_to_template(cols, rows, template_path: Path = TEMPLATE_PATH, output_pa
         ws.title = "Report"
     ws = wb["Report"]
 
-    # Clear existing rows except header
+    # header row: ensure matches df columns
+    for i, col in enumerate(headers, start=1):
+        ws.cell(row=1, column=i, value=col)
+
+    # clear data rows
     if ws.max_row > 1:
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             for cell in row:
                 cell.value = None
 
-    # Write new rows
-    for r_idx, row in enumerate(rows, start=2):
-        for c_idx, val in enumerate(row, start=1):
-            ws.cell(row=r_idx, column=c_idx, value=val)
+    # write data
+    for r_idx, (_, series) in enumerate(df.iterrows(), start=2):
+        for c_idx, col in enumerate(headers, start=1):
+            val = series[col]
+            ws.cell(row=r_idx, column=c_idx, value=None if pd.isna(val) else val)
 
     wb.save(output_path)
+    logger.info(f"Excel written to {output_path.resolve()} (rows={len(df)}, cols={len(headers)})")
     return output_path
 
 
 # =========================
-# Email helpers (draft .eml)
+# Email draft helper
 # =========================
-def create_email_draft(recipient, subject, body, attachment_path: Path, from_addr="you@example.com"):
+def create_email_draft(recipient, subject, body, attachment_path: Path, from_addr="you@example.com") -> Path:
     msg = EmailMessage()
     msg["From"] = from_addr
     msg["To"] = recipient
@@ -130,6 +147,8 @@ def create_email_draft(recipient, subject, body, attachment_path: Path, from_add
     draft_path = Path("draft_email.eml")
     with open(draft_path, "wb") as f:
         f.write(msg.as_bytes())
+
+    logger.info(f"Email draft created at {draft_path.resolve()} (to={recipient}, subject={subject})")
     return draft_path
 
 
@@ -139,8 +158,8 @@ def create_email_draft(recipient, subject, body, attachment_path: Path, from_add
 class AccountLookupApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Account Lookup & Export")
-        self.geometry("900x640")
+        self.title(APP_NAME)
+        self.geometry("980x680")
 
         # --- Inputs ---
         top = ttk.Frame(self, padding=10)
@@ -160,9 +179,9 @@ class AccountLookupApp(tk.Tk):
 
         ttk.Label(top, text="Subject:").grid(row=1, column=2, sticky="e", pady=(6, 0))
         self.subj_var = tk.StringVar(value="Account Report")
-        ttk.Entry(top, textvariable=self.subj_var, width=36).grid(row=1, column=3, padx=6, pady=(6, 0), sticky="w")
+        ttk.Entry(top, textvariable=self.subj_var, width=40).grid(row=1, column=3, padx=6, pady=(6, 0), sticky="w")
 
-        # Optional: choose template location
+        # Template paths
         path_frame = ttk.Frame(self, padding=(10, 0))
         path_frame.pack(fill="x")
         self.template_label_var = tk.StringVar(value=f"Template: {TEMPLATE_PATH.resolve()}")
@@ -176,9 +195,9 @@ class AccountLookupApp(tk.Tk):
         self.query_text = tk.Text(self, height=4, wrap="word", bg="#f7f7f7")
         self.query_text.pack(fill="x", padx=10, pady=5)
 
-        # --- Table ---
+        # --- Table (from DataFrame) ---
         ttk.Label(self, text="Query Result (table):").pack(anchor="w", padx=10)
-        self.tree = ttk.Treeview(self, columns=(), show="headings", height=8)
+        self.tree = ttk.Treeview(self, columns=(), show="headings", height=10)
         self.tree.pack(fill="x", padx=10, pady=5)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -194,10 +213,9 @@ class AccountLookupApp(tk.Tk):
         ttk.Label(self, textvariable=self.status_var, anchor="w").pack(fill="x", side="bottom")
 
         # data cache
-        self.last_cols = []
-        self.last_rows = []
+        self.last_df: pd.DataFrame | None = None
 
-        ensure_demo_db()
+        logger.info("UI initialized")
 
     # ----- UI helpers -----
     def set_columns(self, columns):
@@ -205,7 +223,7 @@ class AccountLookupApp(tk.Tk):
         self.tree["columns"] = columns if columns else ()
         for c in columns:
             self.tree.heading(c, text=c)
-            self.tree.column(c, width=140, anchor="w")
+            self.tree.column(c, width=160, anchor="w")
 
     def populate_rows(self, rows):
         self.tree.delete(*self.tree.get_children())
@@ -224,48 +242,66 @@ class AccountLookupApp(tk.Tk):
         # Pretty key-value blocks
         for row in rows:
             block = "\n".join(f"{c}: {v}" for c, v in zip(cols, row))
-            self.result_text.insert("end", block + "\n" + "-"*48 + "\n")
+            self.result_text.insert("end", block + "\n" + "-"*56 + "\n")
 
     # ----- Actions -----
     def run_query(self):
-        acct_id = self.acct_var.get().strip()
-        if not acct_id:
+        acct_id_raw = self.acct_var.get().strip()
+        if not acct_id_raw:
             messagebox.showinfo("Input required", "Please enter an acct_id.")
             return
+
         try:
-            query, cols, rows = fetch_account(acct_id)
-            self.last_cols, self.last_rows = cols, rows
-            self.show_query(query)
-            if rows:
-                self.set_columns(cols)
-                self.populate_rows(rows)
-                self.show_formatted(cols, rows)
-                self.status_var.set(f"Found {len(rows)} row(s).")
-            else:
-                self.set_columns(["Message"])
-                self.populate_rows([("No results found.",)])
-                self.show_formatted([], [])
-                self.status_var.set("No results.")
+            acct_id = sanitize_acct_id(acct_id_raw)
+        except ValueError as e:
+            logger.warning(f"acct_id validation failed: {acct_id_raw!r} | {e}")
+            messagebox.showerror("Invalid acct_id", str(e))
+            return
+
+        query = build_select_query(acct_id)
+        self.show_query(query)
+        logger.info(f"Running query for acct_id={acct_id}")
+
+        try:
+            df = run_ccb_query(query)  # <-- returns pandas.DataFrame
         except Exception as e:
-            messagebox.showerror("Error", f"Query failed:\n{e}")
+            logger.exception(f"run_ccb_query failed: {e}")
+            messagebox.showerror("Query failed", f"Query failed:\n{e}")
             self.status_var.set("Error.")
+            return
+
+        if df is None or df.empty:
+            logger.info("Query returned no rows.")
+            self.last_df = None
+            self.set_columns(["Message"])
+            self.populate_rows([("No results found.",)])
+            self.show_formatted([], [])
+            self.status_var.set("No results.")
+            return
+
+        self.last_df = df
+        cols, rows = df_to_tuples(df)
+        logger.info(f"Query returned {len(rows)} row(s), columns={cols}")
+
+        self.set_columns(cols)
+        self.populate_rows(rows)
+        self.show_formatted(cols, rows)
+        self.status_var.set(f"Found {len(rows)} row(s).")
 
     def export_and_draft(self):
-        # Use last results if present; otherwise, run the query now
-        if not self.last_rows:
+        if self.last_df is None or self.last_df.empty:
+            # Try running the query with current acct_id
             self.run_query()
-            if not self.last_rows:
-                return  # nothing to export
+            if self.last_df is None or self.last_df.empty:
+                return
 
         try:
-            # Excel
-            out_path = write_to_template(self.last_cols, self.last_rows, TEMPLATE_PATH, OUTPUT_PATH)
+            out_path = write_df_to_template(self.last_df, TEMPLATE_PATH, OUTPUT_PATH)
             self.output_label_var.set(f"Output: {Path(out_path).resolve()}")
 
-            # Email draft
             to = self.to_var.get().strip()
             subject = self.subj_var.get().strip() or "Account Report"
-            acct_id = self.acct_var.get().strip()
+            acct_id = self.acct_var.get().strip() or "(unspecified)"
             body = f"""Hello,
 
 Please find attached the report for account {acct_id}.
@@ -288,6 +324,7 @@ Team
             )
             self.status_var.set("Exported and draft created.")
         except Exception as e:
+            logger.exception(f"Export or draft failed: {e}")
             messagebox.showerror("Error", f"Export or draft failed:\n{e}")
             self.status_var.set("Error during export.")
 
@@ -300,11 +337,18 @@ Team
             global TEMPLATE_PATH
             TEMPLATE_PATH = Path(path)
             self.template_label_var.set(f"Template: {TEMPLATE_PATH.resolve()}")
+            logger.info(f"Template changed to {TEMPLATE_PATH.resolve()}")
 
 
 # =========================
 # Run app
 # =========================
 if __name__ == "__main__":
-    app = AccountLookupApp()
-    app.mainloop()
+    try:
+        app = AccountLookupApp()
+        app.mainloop()
+    except Exception as e:
+        logger.exception(f"Fatal error in mainloop: {e}")
+        raise
+    finally:
+        logger.info("=== Application exit ===")

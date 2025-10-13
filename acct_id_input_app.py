@@ -2,7 +2,6 @@
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from email.message import EmailMessage
 import re
 
 import pandas as pd
@@ -10,20 +9,36 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 # ========= External dependency you provide =========
+# Expected signature: run_ccb_query(sql_query: str) -> pandas.DataFrame
 try:
     from your_module import run_ccb_query  # <-- replace with the real import path
 except Exception:
-    def run_ccb_query(acct_ids: list[str]) -> pd.DataFrame:
-        return pd.DataFrame({
-            "ACCT_Id": acct_ids,
-            "SampleCol": [f"Value for {x}" for x in acct_ids],
-        })
+    # Stub for local UI testing only — replace with your real implementation.
+    def run_ccb_query(sql_query: str) -> pd.DataFrame:
+        # Parse back IDs from the query for a plausible dummy result
+        m = re.search(r"IN\s*\((.*?)\)", sql_query, flags=re.IGNORECASE | re.S)
+        ids = []
+        if m:
+            inside = m.group(1)
+            for tok in inside.split(","):
+                tok = tok.strip().strip("'\"")
+                if tok:
+                    ids.append(tok)
+        return pd.DataFrame({"ACCT_Id": ids, "SampleCol": [f"Value for {x}" for x in ids]})
 
 APP_NAME = "Account Lookup App"
 LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_PATH = LOG_DIR / "acct_lookup.log"
 
+# ==== Configure your query here ====
+# Edit this to your actual schema/table. Column must be ACCT_Id or adjust accordingly.
+QUERY_TEMPLATE = "SELECT * FROM your_schema.your_table WHERE ACCT_Id IN ({in_clause})"
+CHUNK_SIZE = 1000  # Oracle-safe IN list size
+
+# ----------------------------------
+# Logging
+# ----------------------------------
 logger = logging.getLogger(APP_NAME)
 logger.setLevel(logging.INFO)
 _handler = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=3)
@@ -31,37 +46,30 @@ _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 _handler.setFormatter(_formatter)
 logger.addHandler(_handler)
 
-def parse_ids_from_text(text: str) -> list[str]:
-    if not text.strip():
+# ----------------- Helpers -----------------
+def parse_ids_from_text_commas(text: str) -> list[str]:
+    """Parse account IDs by splitting on commas. Trims whitespace and dedupes in order."""
+    if not text:
         return []
-    raw = re.split(r"[,\s]+", text.strip())
-    cleaned, seen, out = [], set(), []
-    for tok in raw:
-        tok = tok.strip().strip("'\"")
-        if tok and tok not in seen:
-            seen.add(tok)
-            out.append(tok)
+    parts = [p.strip() for p in text.split(",")]
+    seen, out = set(), []
+    for p in parts:
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
     return out
 
-def normalize_colname(name: str) -> str:
-    # remove non-alnum and lower it, e.g., "ACCT_Id" -> "acctid", "ACCT ID" -> "acctid"
-    return re.sub(r"[^0-9a-zA-Z]+", "", str(name)).lower()
+def build_in_clause(ids: list[str]) -> str:
+    """Build a SQL IN clause list of quoted literals: 'id1','id2',..."""
+    # Escape single quotes inside ids by doubling them; avoid f-string backslash confusion
+    quoted = ["'" + i.replace("'", "''") + "'" for i in ids]
+    return ",".join(quoted)
 
-def pick_acct_column(columns: list[str]) -> str | None:
-    # direct preferred names
-    preferred = {"acct_id", "acctid", "account_id", "accountid"}
-    normalized = {normalize_colname(c): c for c in columns}
-    # First try normalized preferred
-    for want in preferred:
-        if want in normalized:
-            return normalized[want]
-    # Next: any column whose normalized name contains both acct and id
-    for c in columns:
-        norm = normalize_colname(c)
-        if "acct" in norm and "id" in norm:
-            return c
-    return None
+def chunk_iter(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
 
+# ----------------- App -----------------
 class AccountLookupApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -90,7 +98,7 @@ class AccountLookupApp(tk.Tk):
         self.csv_label.pack(side="left", padx=8)
 
         # Text area
-        text_frame = ttk.LabelFrame(root, text="Account IDs (one per line)")
+        text_frame = ttk.LabelFrame(root, text="Account IDs (comma-separated)")
         text_frame.pack(fill="both", expand=True, pady=(0, 8))
 
         self.acct_text = tk.Text(text_frame, wrap="word", height=14)
@@ -110,7 +118,7 @@ class AccountLookupApp(tk.Tk):
         ttk.Button(out_frame, text="Browse…", command=self.on_choose_output_dir).pack(side="left")
         ttk.Button(out_frame, text="Run Query", command=self.on_run_query).pack(side="left", padx=(12,0))
 
-        # Table
+        # Results table
         table_frame = ttk.LabelFrame(root, text="Results")
         table_frame.pack(fill="both", expand=True, pady=(0, 8))
 
@@ -136,9 +144,7 @@ class AccountLookupApp(tk.Tk):
         if not path:
             return
         try:
-            # Read all values as string to avoid NaN propagation; auto-detect sep; ignore bad lines gracefully.
             df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding_errors="ignore", on_bad_lines="skip")
-            logger.info(f"Loaded CSV: {path}; columns={list(df.columns)}; rows={len(df)}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to read CSV:\n{e}")
             logger.exception(f"CSV read failed: {e}")
@@ -148,31 +154,42 @@ class AccountLookupApp(tk.Tk):
             messagebox.showwarning("Empty CSV", "The selected CSV appears to be empty.")
             return
 
-        col = pick_acct_column(list(df.columns))
-        if col is None:
+        # Try to find a column named like ACCT_Id
+        def norm(name: str) -> str:
+            return re.sub(r"[^0-9a-zA-Z]+", "", str(name)).lower()
+        preferred = {"acct_id", "acctid", "account_id", "accountid"}
+        normalized = {norm(c): c for c in df.columns}
+        acct_col = None
+        for want in preferred:
+            if want in normalized:
+                acct_col = normalized[want]
+                break
+        if acct_col is None:
+            for c in df.columns:
+                n = norm(c)
+                if "acct" in n and "id" in n:
+                    acct_col = c
+                    break
+
+        if acct_col is None:
             first_cols = ", ".join(list(df.columns)[:8])
-            messagebox.showerror(
-                "Missing Column",
-                "Couldn't find an account id column.\n"
-                "Looking for names like ACCT_Id / acct_id / account_id.\n\n"
-                f"Found columns: {first_cols}"
-            )
-            self.status_var.set("CSV missing ACCT_Id-like column.")
+            messagebox.showerror("Missing Column",
+                                 "Couldn't find an account id column (e.g., ACCT_Id).\n"
+                                 f"Found columns: {first_cols}")
             return
 
-        # Extract and clean
-        ids_series = df[col].astype(str)
-        ids = [x.strip() for x in ids_series if x and x.strip()]
+        ids = [x.strip() for x in df[acct_col].astype(str) if x and x.strip()]
+        # Deduplicate
         seen, unique_ids = set(), []
         for x in ids:
             if x not in seen:
                 seen.add(x)
                 unique_ids.append(x)
 
-        # Ensure text widget is editable, then fill
+        # Insert as comma-separated values
         self.acct_text.config(state="normal")
         self.acct_text.delete("1.0", "end")
-        self.acct_text.insert("1.0", "\n".join(unique_ids))
+        self.acct_text.insert("1.0", ", ".join(unique_ids))
         self.acct_text.see("1.0")
 
         self.selected_csv.set(Path(path).name)
@@ -185,15 +202,24 @@ class AccountLookupApp(tk.Tk):
         self.output_dir.set(d)
 
     def on_run_query(self):
-        ids = parse_ids_from_text(self.acct_text.get("1.0", "end"))
+        raw_text = self.acct_text.get("1.0", "end")
+        ids = parse_ids_from_text_commas(raw_text)
         if not ids:
-            messagebox.showwarning("No IDs", "Please enter at least one ACCT_Id (or load a CSV).")
+            messagebox.showwarning("No IDs", "Please enter at least one ACCT_Id (comma-separated), or load a CSV.")
             return
-        self.status_var.set(f"Running query for {len(ids)} account id(s)…")
+
+        self.status_var.set(f"Running queries in chunks of {CHUNK_SIZE} for {len(ids)} IDs…")
         self.update_idletasks()
 
+        all_frames = []
         try:
-            df = run_ccb_query(ids)
+            for idx, chunk in enumerate(chunk_iter(ids, CHUNK_SIZE), start=1):
+                in_clause = build_in_clause(chunk)
+                query = QUERY_TEMPLATE.format(in_clause=in_clause)
+                logger.info(f"Executing chunk {idx} with {len(chunk)} ids")
+                df = run_ccb_query(query)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    all_frames.append(df)
         except Exception as e:
             logger.exception(f"Query failed: {e}")
             messagebox.showerror("Query Error", f"The query failed:\n{e}")
@@ -201,16 +227,17 @@ class AccountLookupApp(tk.Tk):
             self.result_df = None
             return
 
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            messagebox.showinfo("No Results", "The query returned no rows.")
+        if not all_frames:
+            messagebox.showinfo("No Results", "The query returned no rows for the provided IDs.")
             self.status_var.set("No results.")
             self.result_df = None
             self.tree.delete(*self.tree.get_children())
             return
 
-        self.result_df = df
-        self.populate_table(df)
-        self.status_var.set(f"Query complete. {len(df)} rows.")
+        result = pd.concat(all_frames, ignore_index=True)
+        self.result_df = result
+        self.populate_table(result)
+        self.status_var.set(f"Query complete. {len(result)} rows from {len(all_frames)} chunk(s).")
 
     def populate_table(self, df: pd.DataFrame):
         self.tree.delete(*self.tree.get_children())
@@ -249,6 +276,9 @@ class AccountLookupApp(tk.Tk):
             logger.exception(f"Export failed: {e}")
             messagebox.showerror("Export Error", f"Failed to export:\n{e}")
 
+# =========================
+# Run app
+# =========================
 if __name__ == "__main__":
     try:
         app = AccountLookupApp()

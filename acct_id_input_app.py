@@ -1,348 +1,254 @@
+
 import logging
 from logging.handlers import RotatingFileHandler
-import re
 from pathlib import Path
 from email.message import EmailMessage
+import re
 
 import pandas as pd
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import openpyxl
-from openpyxl import load_workbook
 
 # ========= External dependency you provide =========
-# This must be implemented in your environment.
-# It should return a pandas.DataFrame with columns in the same order as the SELECT.
-from your_module import run_ccb_query  # <-- replace with the real import path
+try:
+    from your_module import run_ccb_query  # <-- replace with the real import path
+except Exception:
+    def run_ccb_query(acct_ids: list[str]) -> pd.DataFrame:
+        return pd.DataFrame({
+            "ACCT_Id": acct_ids,
+            "SampleCol": [f"Value for {x}" for x in acct_ids],
+        })
 
+APP_NAME = "Account Lookup App"
+LOG_DIR = Path("./logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH = LOG_DIR / "acct_lookup.log"
 
-# =========================
-# Config
-# =========================
-LOG_PATH = Path("account_app.log")
-TEMPLATE_PATH = Path("account_template.xlsx")
-OUTPUT_PATH = Path("account_report.xlsx")
-
-APP_NAME = "Account Lookup & Export (DF/CCB)"
-
-
-# =========================
-# Logging
-# =========================
-logger = logging.getLogger("account_app")
+logger = logging.getLogger(APP_NAME)
 logger.setLevel(logging.INFO)
+_handler = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=3)
+_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_handler.setFormatter(_formatter)
+logger.addHandler(_handler)
 
-# Rotate at ~1 MB, keep 5 backups
-handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=5, encoding="utf-8")
-fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-handler.setFormatter(fmt)
-logger.addHandler(handler)
+def parse_ids_from_text(text: str) -> list[str]:
+    if not text.strip():
+        return []
+    raw = re.split(r"[,\s]+", text.strip())
+    cleaned, seen, out = [], set(), []
+    for tok in raw:
+        tok = tok.strip().strip("'\"")
+        if tok and tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+    return out
 
-logger.info("=== Application start ===")
+def normalize_colname(name: str) -> str:
+    # remove non-alnum and lower it, e.g., "ACCT_Id" -> "acctid", "ACCT ID" -> "acctid"
+    return re.sub(r"[^0-9a-zA-Z]+", "", str(name)).lower()
 
+def pick_acct_column(columns: list[str]) -> str | None:
+    # direct preferred names
+    preferred = {"acct_id", "acctid", "account_id", "accountid"}
+    normalized = {normalize_colname(c): c for c in columns}
+    # First try normalized preferred
+    for want in preferred:
+        if want in normalized:
+            return normalized[want]
+    # Next: any column whose normalized name contains both acct and id
+    for c in columns:
+        norm = normalize_colname(c)
+        if "acct" in norm and "id" in norm:
+            return c
+    return None
 
-# =========================
-# Utilities
-# =========================
-SAFE_ACCT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-\.]{1,64}$")
-
-def sanitize_acct_id(acct_id: str) -> str:
-    """
-    Enforce a conservative allowlist for acct_id to reduce injection risk since
-    run_ccb_query expects a raw SQL string.
-    """
-    if not acct_id or not SAFE_ACCT_ID_PATTERN.match(acct_id):
-        raise ValueError("acct_id contains invalid characters.")
-    return acct_id
-
-def build_select_query(acct_id: str) -> str:
-    # NOTE: Because run_ccb_query takes a string, we avoid concatenating unsafe input.
-    # We sanitize acct_id first (allowlist). If your CCB layer supports parameters,
-    # switch to parameterized queries there.
-    return f"""
-        SELECT
-            acct_id,
-            name,
-            segment,
-            balance,
-            status
-        FROM accounts
-        WHERE acct_id = '{acct_id}'
-    """.strip()
-
-def df_to_tuples(df: pd.DataFrame):
-    """Return (columns, rows_as_tuples) in display-friendly types."""
-    cols = list(df.columns)
-    # Ensure pure Python types for Tk/Excel
-    rows = [tuple(None if pd.isna(v) else (v.item() if hasattr(v, "item") else v) for v in row)
-            for row in df.itertuples(index=False, name=None)]
-    return cols, rows
-
-
-# =========================
-# Excel helpers (template-based)
-# =========================
-def ensure_template_with_headers(headers):
-    """Create a very simple template if none exists."""
-    if not TEMPLATE_PATH.exists():
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Report"
-        for i, col in enumerate(headers, start=1):
-            ws.cell(row=1, column=i, value=col)
-        wb.save(TEMPLATE_PATH)
-        logger.info(f"Template created at {TEMPLATE_PATH.resolve()} with headers: {headers}")
-
-def write_df_to_template(df: pd.DataFrame, template_path: Path = TEMPLATE_PATH, output_path: Path = OUTPUT_PATH) -> Path:
-    if df is None or df.empty:
-        raise ValueError("No data to write to template.")
-    headers = list(df.columns)
-    ensure_template_with_headers(headers)
-
-    wb = load_workbook(template_path)
-    if "Report" not in wb.sheetnames:
-        ws = wb.active
-        ws.title = "Report"
-    ws = wb["Report"]
-
-    # header row: ensure matches df columns
-    for i, col in enumerate(headers, start=1):
-        ws.cell(row=1, column=i, value=col)
-
-    # clear data rows
-    if ws.max_row > 1:
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-            for cell in row:
-                cell.value = None
-
-    # write data
-    for r_idx, (_, series) in enumerate(df.iterrows(), start=2):
-        for c_idx, col in enumerate(headers, start=1):
-            val = series[col]
-            ws.cell(row=r_idx, column=c_idx, value=None if pd.isna(val) else val)
-
-    wb.save(output_path)
-    logger.info(f"Excel written to {output_path.resolve()} (rows={len(df)}, cols={len(headers)})")
-    return output_path
-
-
-# =========================
-# Email draft helper
-# =========================
-def create_email_draft(recipient, subject, body, attachment_path: Path, from_addr="you@example.com") -> Path:
-    msg = EmailMessage()
-    msg["From"] = from_addr
-    msg["To"] = recipient
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    with open(attachment_path, "rb") as f:
-        msg.add_attachment(
-            f.read(),
-            maintype="application",
-            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=attachment_path.name,
-        )
-
-    draft_path = Path("draft_email.eml")
-    with open(draft_path, "wb") as f:
-        f.write(msg.as_bytes())
-
-    logger.info(f"Email draft created at {draft_path.resolve()} (to={recipient}, subject={subject})")
-    return draft_path
-
-
-# =========================
-# Tkinter UI
-# =========================
 class AccountLookupApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("980x680")
+        self.geometry("900x650")
+        self.minsize(800, 600)
 
-        # --- Inputs ---
-        top = ttk.Frame(self, padding=10)
-        top.pack(fill="x")
-
-        ttk.Label(top, text="acct_id:").grid(row=0, column=0, sticky="w")
-        self.acct_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.acct_var, width=30).grid(row=0, column=1, padx=8, pady=4, sticky="w")
-
-        ttk.Button(top, text="Run Query", command=self.run_query).grid(row=0, column=2, padx=6)
-        ttk.Button(top, text="Export → Excel + Draft Email", command=self.export_and_draft).grid(row=0, column=3, padx=6)
-
-        # Email fields
-        ttk.Label(top, text="To:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.to_var = tk.StringVar(value="manager@example.com")
-        ttk.Entry(top, textvariable=self.to_var, width=30).grid(row=1, column=1, padx=8, pady=(6, 0), sticky="w")
-
-        ttk.Label(top, text="Subject:").grid(row=1, column=2, sticky="e", pady=(6, 0))
-        self.subj_var = tk.StringVar(value="Account Report")
-        ttk.Entry(top, textvariable=self.subj_var, width=40).grid(row=1, column=3, padx=6, pady=(6, 0), sticky="w")
-
-        # Template paths
-        path_frame = ttk.Frame(self, padding=(10, 0))
-        path_frame.pack(fill="x")
-        self.template_label_var = tk.StringVar(value=f"Template: {TEMPLATE_PATH.resolve()}")
-        self.output_label_var = tk.StringVar(value=f"Output: {OUTPUT_PATH.resolve()}")
-        ttk.Label(path_frame, textvariable=self.template_label_var).grid(row=0, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(path_frame, textvariable=self.output_label_var).grid(row=1, column=0, sticky="w", pady=(2, 8))
-        ttk.Button(path_frame, text="Change Template...", command=self.pick_template).grid(row=0, column=1, padx=8, sticky="e")
-
-        # --- SQL shown ---
-        ttk.Label(self, text="Executed SQL:").pack(anchor="w", padx=10)
-        self.query_text = tk.Text(self, height=4, wrap="word", bg="#f7f7f7")
-        self.query_text.pack(fill="x", padx=10, pady=5)
-
-        # --- Table (from DataFrame) ---
-        ttk.Label(self, text="Query Result (table):").pack(anchor="w", padx=10)
-        self.tree = ttk.Treeview(self, columns=(), show="headings", height=10)
-        self.tree.pack(fill="x", padx=10, pady=5)
-        vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        vsb.place(in_=self.tree, relx=1.0, rely=0, relheight=1.0, anchor="ne")
-
-        # --- Formatted details ---
-        ttk.Label(self, text="Formatted Result:").pack(anchor="w", padx=10)
-        self.result_text = tk.Text(self, height=10, wrap="word", bg="#eef6ff")
-        self.result_text.pack(fill="both", expand=True, padx=10, pady=5)
-
-        # --- Status ---
+        self.output_dir = tk.StringVar(value=str(Path.cwd() / "output"))
+        self.selected_csv = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status_var, anchor="w").pack(fill="x", side="bottom")
+        self.result_df: pd.DataFrame | None = None
 
-        # data cache
-        self.last_df: pd.DataFrame | None = None
+        self._build_ui()
 
-        logger.info("UI initialized")
+    def _build_ui(self):
+        root = ttk.Frame(self, padding=12)
+        root.pack(fill="both", expand=True)
 
-    # ----- UI helpers -----
-    def set_columns(self, columns):
-        self.tree.delete(*self.tree.get_children())
-        self.tree["columns"] = columns if columns else ()
-        for c in columns:
-            self.tree.heading(c, text=c)
-            self.tree.column(c, width=160, anchor="w")
+        # Top: Load CSV
+        top_bar = ttk.Frame(root)
+        top_bar.pack(fill="x", pady=(0, 8))
 
-    def populate_rows(self, rows):
-        self.tree.delete(*self.tree.get_children())
-        for row in rows:
-            self.tree.insert("", "end", values=row)
+        ttk.Label(top_bar, text="Load ACCT_Id from CSV:").pack(side="left")
+        ttk.Button(top_bar, text="Choose CSV…", command=self.on_choose_csv).pack(side="left", padx=(8, 0))
+        self.csv_label = ttk.Label(top_bar, textvariable=self.selected_csv, foreground="#555")
+        self.csv_label.pack(side="left", padx=8)
 
-    def show_query(self, query):
-        self.query_text.delete("1.0", "end")
-        self.query_text.insert("1.0", query.strip())
+        # Text area
+        text_frame = ttk.LabelFrame(root, text="Account IDs (one per line)")
+        text_frame.pack(fill="both", expand=True, pady=(0, 8))
 
-    def show_formatted(self, cols, rows):
-        self.result_text.delete("1.0", "end")
-        if not rows:
-            self.result_text.insert("1.0", "No results found.")
-            return
-        # Pretty key-value blocks
-        for row in rows:
-            block = "\n".join(f"{c}: {v}" for c, v in zip(cols, row))
-            self.result_text.insert("end", block + "\n" + "-"*56 + "\n")
+        self.acct_text = tk.Text(text_frame, wrap="word", height=14)
+        self.acct_text.pack(side="left", fill="both", expand=True, padx=(6,0), pady=6)
 
-    # ----- Actions -----
-    def run_query(self):
-        acct_id_raw = self.acct_var.get().strip()
-        if not acct_id_raw:
-            messagebox.showinfo("Input required", "Please enter an acct_id.")
-            return
+        yscroll = ttk.Scrollbar(text_frame, orient="vertical", command=self.acct_text.yview)
+        yscroll.pack(side="right", fill="y", padx=(0,6), pady=6)
+        self.acct_text.configure(yscrollcommand=yscroll.set)
 
-        try:
-            acct_id = sanitize_acct_id(acct_id_raw)
-        except ValueError as e:
-            logger.warning(f"acct_id validation failed: {acct_id_raw!r} | {e}")
-            messagebox.showerror("Invalid acct_id", str(e))
-            return
+        # Output dir + Run
+        out_frame = ttk.Frame(root)
+        out_frame.pack(fill="x", pady=(0, 8))
 
-        query = build_select_query(acct_id)
-        self.show_query(query)
-        logger.info(f"Running query for acct_id={acct_id}")
+        ttk.Label(out_frame, text="Output directory:").pack(side="left")
+        self.output_entry = ttk.Entry(out_frame, textvariable=self.output_dir, width=50)
+        self.output_entry.pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(out_frame, text="Browse…", command=self.on_choose_output_dir).pack(side="left")
+        ttk.Button(out_frame, text="Run Query", command=self.on_run_query).pack(side="left", padx=(12,0))
 
-        try:
-            df = run_ccb_query(query)  # <-- returns pandas.DataFrame
-        except Exception as e:
-            logger.exception(f"run_ccb_query failed: {e}")
-            messagebox.showerror("Query failed", f"Query failed:\n{e}")
-            self.status_var.set("Error.")
-            return
+        # Table
+        table_frame = ttk.LabelFrame(root, text="Results")
+        table_frame.pack(fill="both", expand=True, pady=(0, 8))
 
-        if df is None or df.empty:
-            logger.info("Query returned no rows.")
-            self.last_df = None
-            self.set_columns(["Message"])
-            self.populate_rows([("No results found.",)])
-            self.show_formatted([], [])
-            self.status_var.set("No results.")
-            return
+        self.tree = ttk.Treeview(table_frame, show="headings", height=10)
+        self.tree.pack(side="left", fill="both", expand=True, padx=(6,0), pady=6)
 
-        self.last_df = df
-        cols, rows = df_to_tuples(df)
-        logger.info(f"Query returned {len(rows)} row(s), columns={cols}")
+        table_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        table_scroll.pack(side="right", fill="y", padx=(0,6), pady=6)
+        self.tree.configure(yscrollcommand=table_scroll.set)
 
-        self.set_columns(cols)
-        self.populate_rows(rows)
-        self.show_formatted(cols, rows)
-        self.status_var.set(f"Found {len(rows)} row(s).")
+        # Bottom: Export
+        bottom_bar = ttk.Frame(root)
+        bottom_bar.pack(fill="x")
+        ttk.Button(bottom_bar, text="Export Results", command=self.on_export).pack(side="right")
+        ttk.Label(bottom_bar, textvariable=self.status_var).pack(side="left")
 
-    def export_and_draft(self):
-        if self.last_df is None or self.last_df.empty:
-            # Try running the query with current acct_id
-            self.run_query()
-            if self.last_df is None or self.last_df.empty:
-                return
-
-        try:
-            out_path = write_df_to_template(self.last_df, TEMPLATE_PATH, OUTPUT_PATH)
-            self.output_label_var.set(f"Output: {Path(out_path).resolve()}")
-
-            to = self.to_var.get().strip()
-            subject = self.subj_var.get().strip() or "Account Report"
-            acct_id = self.acct_var.get().strip() or "(unspecified)"
-            body = f"""Hello,
-
-Please find attached the report for account {acct_id}.
-
-Regards,
-Team
-"""
-            draft_path = create_email_draft(
-                recipient=to,
-                subject=subject,
-                body=body,
-                attachment_path=out_path,
-                from_addr="you@example.com",
-            )
-
-            messagebox.showinfo(
-                "Success",
-                f"Excel saved to:\n{out_path}\n\nDraft email saved to:\n{draft_path}\n\n"
-                "Open the .eml in your mail client to review/send."
-            )
-            self.status_var.set("Exported and draft created.")
-        except Exception as e:
-            logger.exception(f"Export or draft failed: {e}")
-            messagebox.showerror("Error", f"Export or draft failed:\n{e}")
-            self.status_var.set("Error during export.")
-
-    def pick_template(self):
+    # ---------- Actions ----------
+    def on_choose_csv(self):
         path = filedialog.askopenfilename(
-            title="Choose Excel Template",
-            filetypes=[("Excel files", "*.xlsx")]
+            title="Select CSV with ACCT_Id column",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
         )
-        if path:
-            global TEMPLATE_PATH
-            TEMPLATE_PATH = Path(path)
-            self.template_label_var.set(f"Template: {TEMPLATE_PATH.resolve()}")
-            logger.info(f"Template changed to {TEMPLATE_PATH.resolve()}")
+        if not path:
+            return
+        try:
+            # Read all values as string to avoid NaN propagation; auto-detect sep; ignore bad lines gracefully.
+            df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding_errors="ignore", on_bad_lines="skip")
+            logger.info(f"Loaded CSV: {path}; columns={list(df.columns)}; rows={len(df)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read CSV:\n{e}")
+            logger.exception(f"CSV read failed: {e}")
+            return
 
+        if df.empty:
+            messagebox.showwarning("Empty CSV", "The selected CSV appears to be empty.")
+            return
 
-# =========================
-# Run app
-# =========================
+        col = pick_acct_column(list(df.columns))
+        if col is None:
+            first_cols = ", ".join(list(df.columns)[:8])
+            messagebox.showerror(
+                "Missing Column",
+                "Couldn't find an account id column.\n"
+                "Looking for names like ACCT_Id / acct_id / account_id.\n\n"
+                f"Found columns: {first_cols}"
+            )
+            self.status_var.set("CSV missing ACCT_Id-like column.")
+            return
+
+        # Extract and clean
+        ids_series = df[col].astype(str)
+        ids = [x.strip() for x in ids_series if x and x.strip()]
+        seen, unique_ids = set(), []
+        for x in ids:
+            if x not in seen:
+                seen.add(x)
+                unique_ids.append(x)
+
+        # Ensure text widget is editable, then fill
+        self.acct_text.config(state="normal")
+        self.acct_text.delete("1.0", "end")
+        self.acct_text.insert("1.0", "\n".join(unique_ids))
+        self.acct_text.see("1.0")
+
+        self.selected_csv.set(Path(path).name)
+        self.status_var.set(f"Loaded {len(unique_ids)} unique IDs from '{Path(path).name}'.")
+
+    def on_choose_output_dir(self):
+        d = filedialog.askdirectory(title="Select Output Directory", mustexist=True)
+        if not d:
+            return
+        self.output_dir.set(d)
+
+    def on_run_query(self):
+        ids = parse_ids_from_text(self.acct_text.get("1.0", "end"))
+        if not ids:
+            messagebox.showwarning("No IDs", "Please enter at least one ACCT_Id (or load a CSV).")
+            return
+        self.status_var.set(f"Running query for {len(ids)} account id(s)…")
+        self.update_idletasks()
+
+        try:
+            df = run_ccb_query(ids)
+        except Exception as e:
+            logger.exception(f"Query failed: {e}")
+            messagebox.showerror("Query Error", f"The query failed:\n{e}")
+            self.status_var.set("Query failed.")
+            self.result_df = None
+            return
+
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            messagebox.showinfo("No Results", "The query returned no rows.")
+            self.status_var.set("No results.")
+            self.result_df = None
+            self.tree.delete(*self.tree.get_children())
+            return
+
+        self.result_df = df
+        self.populate_table(df)
+        self.status_var.set(f"Query complete. {len(df)} rows.")
+
+    def populate_table(self, df: pd.DataFrame):
+        self.tree.delete(*self.tree.get_children())
+        self.tree["columns"] = list(df.columns)
+        for col in df.columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=120, anchor="w")
+        for _, row in df.iterrows():
+            self.tree.insert("", "end", values=[row[c] for c in df.columns])
+
+    def on_export(self):
+        if self.result_df is None or self.result_df.empty:
+            messagebox.showwarning("Nothing to Export", "Run a query first; there are no results to export.")
+            return
+        out_dir = Path(self.output_dir.get()).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx"), ("CSV", "*.csv")],
+            initialdir=str(out_dir),
+            initialfile="account_lookup_results.xlsx",
+            title="Export Results"
+        )
+        if not save_path:
+            return
+
+        try:
+            if save_path.lower().endswith(".csv"):
+                self.result_df.to_csv(save_path, index=False)
+            else:
+                self.result_df.to_excel(save_path, index=False)
+            self.status_var.set(f"Exported results to {save_path}")
+            messagebox.showinfo("Export Complete", f"Exported to:\n{save_path}")
+        except Exception as e:
+            logger.exception(f"Export failed: {e}")
+            messagebox.showerror("Export Error", f"Failed to export:\n{e}")
+
 if __name__ == "__main__":
     try:
         app = AccountLookupApp()

@@ -1,3 +1,4 @@
+from tkinter import messagebox
 
 import logging
 from logging.handlers import RotatingFileHandler
@@ -33,7 +34,7 @@ LOG_PATH = LOG_DIR / "acct_lookup.log"
 
 # ==== Configure your query here ====
 # Edit this to your actual schema/table. Column must be ACCT_Id or adjust accordingly.
-QUERY_TEMPLATE = "SELECT * FROM your_schema.your_table WHERE ACCT_Id IN ({in_clause})"
+QUERY_TEMPLATE = "SELECT * FROM your_schema.your_table WHERE ACCT_Id IN (1231)"
 CHUNK_SIZE = 1000  # Oracle-safe IN list size
 
 # ----------------------------------
@@ -47,6 +48,17 @@ _handler.setFormatter(_formatter)
 logger.addHandler(_handler)
 
 # ----------------- Helpers -----------------
+def _detect_acct_id_column(df):
+    """
+    Try to find the account-id column in df. Returns the column name or None if not found.
+    Matches names like ACCT_Id, ACCT_ID, acct_id (case/underscore-insensitive).
+    """
+    def _norm(s: str) -> str:
+        import re as _re
+        return _re.sub(r"[_\W]+", "", str(s)).lower()
+    candidates = [c for c in df.columns if _norm(c) == "acctid"]
+    return candidates[0] if candidates else None
+    
 def parse_ids_from_text_commas(text: str) -> list[str]:
     """Parse account IDs by splitting on commas. Trims whitespace and dedupes in order."""
     if not text:
@@ -238,6 +250,143 @@ class AccountLookupApp(tk.Tk):
         self.result_df = result
         self.populate_table(result)
         self.status_var.set(f"Query complete. {len(result)} rows from {len(all_frames)} chunk(s).")
+
+
+        all_df = result  # alias for missing-ID export
+
+
+
+        # === Export list of input IDs that were NOT returned by the query ===
+
+        try:
+
+            # Use the same IDs the user provided
+
+            if hasattr(self, "acct_text"):
+
+                input_text = self.acct_text.get("1.0", "end")
+
+            else:
+
+                # Fallback: try an attribute or variable commonly used
+
+                input_text = locals().get("input_text", "") or globals().get("input_text", "")
+
+            # Flexible parser: split by commas/newlines/whitespace
+
+            raw_ids = [s.strip() for s in re.split(r"[\s,]+", str(input_text)) if s.strip()]
+
+            input_ids = raw_ids
+
+
+            # Identify the account-id column in results
+
+            acct_col = _detect_acct_id_column(all_df) if ("all_df" in locals() or "all_df" in globals()) and isinstance(all_df, pd.DataFrame) and not all_df.empty else None
+
+
+            if acct_col is None:
+
+                # If we can't detect an acct-id column (or no rows returned),
+
+                # treat as if no IDs were found in results.
+
+                returned_ids = set()
+
+            else:
+
+                # Normalize to strings and strip whitespace just in case
+
+                returned_ids = {
+
+                    str(x).strip()
+
+                    for x in all_df[acct_col].dropna().astype(str).tolist()
+
+                    if str(x).strip()
+
+                }
+
+
+            missing_ids = [i for i in input_ids if i not in returned_ids]
+
+
+            if missing_ids:
+
+                if hasattr(self, "output_dir"):
+
+                    out_dir = Path(self.output_dir.get()).expanduser()
+
+                else:
+
+                    # fallback to current working directory
+
+                    out_dir = Path.cwd()
+
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+
+                ts = pd.Timestamp.now().strftime("%Y-%m-%d_%H%M")
+
+                missing_path = out_dir / f"missing_accounts_{ts}.csv"
+
+
+                pd.DataFrame({"ACCT_Id": missing_ids}).to_csv(missing_path, index=False)
+
+                try:
+
+                    logger.info(f"Wrote missing IDs CSV: {missing_path}")
+
+                except Exception:
+
+                    pass
+
+                try:
+
+                    if hasattr(self, "status_var"):
+
+                        self.status_var.set(self.status_var.get() + f" | Missing IDs saved: {missing_path.name}")
+
+                except Exception:
+
+                    pass
+
+            else:
+
+                try:
+
+                    logger.info("No missing IDs; all input IDs were returned by the query.")
+
+                except Exception:
+
+                    pass
+
+                try:
+
+                    if hasattr(self, "status_var"):
+
+                        self.status_var.set(self.status_var.get() + " | No missing IDs.")
+
+                except Exception:
+
+                    pass
+
+        except Exception as e:
+
+            try:
+
+                logger.exception(f"Failed to write missing IDs CSV: {e}")
+
+            except Exception:
+
+                pass
+
+            try:
+
+                messagebox.showwarning("Missing IDs Export", f"Could not write missing IDs CSV:\n{e}")
+
+            except Exception:
+
+                pass
 
     def populate_table(self, df: pd.DataFrame):
         self.tree.delete(*self.tree.get_children())
